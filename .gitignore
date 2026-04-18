@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+data/real-time-exercise-recognition-dataset/
+data/workoutfitness-video/
+extra/.DS_Store
+data/.DS_Store

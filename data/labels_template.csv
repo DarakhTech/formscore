@@ -1,0 +1,10 @@
+video_id,source,rater,depth,knee_tracking,spine,hip_hinge,heel_contact,symmetry,descent,ascent,tempo,lockout,total,notes
+squat_001,kaggle,rater_aveg,,,,,,,,,,,,
+squat_001,kaggle,rater_harsha,,,,,,,,,,,,
+squat_001,kaggle,rater_mihir,,,,,,,,,,,,
+squat_002,kaggle,rater_aveg,,,,,,,,,,,,
+squat_002,kaggle,rater_harsha,,,,,,,,,,,,
+squat_002,kaggle,rater_mihir,,,,,,,,,,,,
+squat_003,kaggle,rater_aveg,,,,,,,,,,,,
+squat_003,kaggle,rater_harsha,,,,,,,,,,,,
+squat_003,kaggle,rater_mihir,,,,,,,,,,,,
