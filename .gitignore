@@ -214,4 +214,3 @@ results/*
 .DS_Store
 checkpoints/
 !results/.gitkeep
-extra/
