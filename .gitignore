@@ -210,3 +210,7 @@ data/real-time-exercise-recognition-dataset/
 data/workoutfitness-video/
 extra/.DS_Store
 data/.DS_Store
+results/*
+.DS_Store
+checkpoints/
+!results/.gitkeep
