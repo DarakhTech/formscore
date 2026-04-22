@@ -62,6 +62,7 @@ from preprocessing.normalizer import normalize
 from preprocessing.feature_engineer import build_feature_matrix, resample_to_60
 from explainability.shap_explainer import FormScoreExplainer, FEATURE_NAMES
 from explainability.feedback_lookup import get_feedback
+from modeling.evaluate import _build_dataset
 
 # ── MediaPipe model ───────────────────────────────────────
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker.task")
@@ -167,17 +168,40 @@ def _segment_reps(landmarks_raw: np.ndarray,
             merged.append(r)
     return merged
 
-# ── Stub scorer (replaced by real model in Sprint 3) ─────
+# ── Stub scorer (fallback when checkpoint is missing) ─────
 
 def _stub_model(X: np.ndarray) -> np.ndarray:
-    """
-    Stub scorer for pipeline testing without a trained model.
-    Penalizes knee asymmetry and spine tilt.
-    """
+    """Heuristic fallback: penalizes knee asymmetry and spine tilt."""
     symmetry = X[:, :, 7].mean(axis=1)
     spine    = X[:, :, 4].mean(axis=1) / 180.0
     score    = 1.0 - 0.4 * symmetry - 0.3 * spine
     return np.clip(score, 0.0, 1.0).astype(np.float32)
+
+
+def _load_real_model():
+    """Return predict_fn from the trained BiLSTM, or None if checkpoint missing."""
+    try:
+        from modeling.load_model import predict_fn
+        # Trigger the load now so errors surface at init time, not inference time
+        predict_fn(np.zeros((1, 60, 8), dtype=np.float32))
+        return predict_fn
+    except FileNotFoundError:
+        return None
+
+
+def _load_background(n: int = 50, seed: int = 42) -> np.ndarray:
+    """
+    Sample n real reps from the synthetic dataset as SHAP background.
+    Falls back to random noise if the dataset can't be loaded.
+    """
+    try:
+        X, _, _ = _build_dataset()
+        rng     = np.random.default_rng(seed)
+        idx     = rng.choice(len(X), size=min(n, len(X)), replace=False)
+        return X[idx].astype(np.float32)
+    except Exception:
+        rng = np.random.default_rng(seed)
+        return rng.random((n, 60, 8)).astype(np.float32)
 
 
 # ── Main pipeline class ───────────────────────────────────
@@ -189,9 +213,9 @@ class FormScorePipeline:
     Parameters
     ----------
     model_fn   : callable [N, 60, 8] → [N]
-                 Scoring model. Defaults to stub until real model exists.
+                 Scoring model. Auto-loads trained BiLSTM; falls back to stub.
     background : np.ndarray [B, 60, 8]
-                 SHAP background dataset. Defaults to random if None.
+                 SHAP background dataset. Auto-loads 50 real reps if None.
     exercise   : str
                  Exercise type label for output metadata.
     """
@@ -201,14 +225,21 @@ class FormScorePipeline:
                  background: np.ndarray = None,
                  exercise: str = "squat"):
 
-        self.model_fn  = model_fn or _stub_model
-        self.exercise  = exercise
+        if model_fn is not None:
+            self.model_fn = model_fn
+        else:
+            real = _load_real_model()
+            if real is not None:
+                print("  [pipeline] Using trained BiLSTM scorer.")
+                self.model_fn = real
+            else:
+                print("  [pipeline] Checkpoint not found — using stub scorer.")
+                self.model_fn = _stub_model
 
-        # Build SHAP explainer
+        self.exercise = exercise
+
         if background is None:
-            # Random background until real training data is passed in
-            rng        = np.random.default_rng(42)
-            background = rng.random((50, 60, 8)).astype(np.float32)
+            background = _load_background(n=50)
 
         self.explainer = FormScoreExplainer(
             self.model_fn, background, model_type="kernel"
