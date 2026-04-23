@@ -1,109 +1,108 @@
-# preprocessing/rep_segmenter.py
 """
-Rule-based rep segmenter using scipy peak detection on hip Y trajectory.
+preprocessing/rep_segmenter.py
 
-For squats: landmark 23 (left hip) + 24 (right hip) midpoint Y.
-Standing = hip Y is HIGH (in image coords, Y increases downward).
-Bottom of squat = hip Y is LOW.
+Standalone rep segmenter for FormScore.
 
-Rep boundary = peak in hip_y signal (subject is standing = between reps).
+Extracts hip midpoint Y from raw landmarks, smooths with a Gaussian
+filter, finds squat bottoms (local maxima) and standing tops (local
+minima), and pairs them into (start, end) rep boundaries.
 
-Input:  landmarks [T, 33, 4]
-Output: list of (start_frame, end_frame) tuples, one per rep
+Input:  raw (unnormalized) landmarks [T, 33, 4]
+Output: list of (start, end) frame-index tuples, one per rep
 """
 
 import numpy as np
-from scipy.signal import find_peaks, savgol_filter
+from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter1d
 
-
-# MediaPipe landmark indices
-LEFT_HIP  = 23
-RIGHT_HIP = 24
+_LEFT_HIP  = 23
+_RIGHT_HIP = 24
 
 
 def segment_reps(
-    landmarks: np.ndarray,
-    fps: float = 30.0,
-    min_rep_duration_s: float = 0.8,   # reps faster than this are noise
-    prominence: float = 0.02,          # min peak prominence in normalized coords
-    smooth_window: int = 15,           # savgol smoothing window (must be odd)
+    landmarks_raw: np.ndarray,
+    smooth_sigma: float = 3.0,
+    min_distance: int = 30,
 ) -> list[tuple[int, int]]:
     """
-    Segment squat reps from landmark array.
+    Segment squat reps from raw landmark array.
 
-    Args:
-        landmarks:           [T, 33, 4] float32 array
-        fps:                 video frame rate (used for min rep duration filter)
-        min_rep_duration_s:  minimum seconds per rep (filters false peaks)
-        prominence:          scipy find_peaks prominence threshold
-        smooth_window:       Savitzky-Golay filter window size
+    Parameters
+    ----------
+    landmarks_raw : np.ndarray [T, 33, 4]
+        Raw (unnormalized) MediaPipe landmarks.
+    smooth_sigma  : float
+        Gaussian smoothing sigma applied to hip Y trajectory.
+    min_distance  : int
+        Minimum frame distance between detected peaks.
 
-    Returns:
-        List of (start_frame, end_frame) tuples. Each tuple = one rep.
+    Returns
+    -------
+    list of (start, end) tuples — one per detected rep.
+    Returns [(0, T-1)] if no reps are detected.
     """
-    T = landmarks.shape[0]
-    if T < 10:
-        return []
+    T = landmarks_raw.shape[0]
 
-    # 1. Extract hip midpoint Y across all frames
-    left_hip_y  = landmarks[:, LEFT_HIP,  1]   # Y coordinate
-    right_hip_y = landmarks[:, RIGHT_HIP, 1]
-    hip_y       = (left_hip_y + right_hip_y) / 2.0
+    hip_mid_y = (
+        landmarks_raw[:, _LEFT_HIP,  1] +
+        landmarks_raw[:, _RIGHT_HIP, 1]
+    ) / 2.0                                         # [T]
 
-    # 2. Handle zero-padded frames (no pose detected) — interpolate
-    valid_mask = (landmarks[:, LEFT_HIP, 3] > 0.3) & (landmarks[:, RIGHT_HIP, 3] > 0.3)
-    if valid_mask.sum() < 5:
-        return []
-    hip_y = _interpolate_missing(hip_y, valid_mask)
+    smoothed     = gaussian_filter1d(hip_mid_y, sigma=smooth_sigma)
+    signal_range = smoothed.max() - smoothed.min()
+    prominence   = signal_range * 0.30
 
-    # 3. Smooth the signal
-    window = min(smooth_window, T if T % 2 == 1 else T - 1)
-    if window >= 5:
-        hip_y_smooth = savgol_filter(hip_y, window_length=window, polyorder=2)
-    else:
-        hip_y_smooth = hip_y
+    bottoms, _ = find_peaks( smoothed, distance=min_distance, prominence=prominence)
+    tops,    _ = find_peaks(-smoothed, distance=min_distance, prominence=prominence)
 
-    # 4. Find peaks (standing position = local maxima in Y)
-    min_distance = int(min_rep_duration_s * fps)
-    peaks, props = find_peaks(
-        hip_y_smooth,
-        distance=min_distance,
-        prominence=prominence,
-    )
+    if len(bottoms) == 0 or len(tops) == 0:
+        return [(0, T - 1)]
 
-    if len(peaks) < 2:
-        return []
-
-    # 5. Convert peaks to (start, end) rep segments
-    #    Each rep = from one peak to the next peak
     reps = []
-    for i in range(len(peaks) - 1):
-        start = peaks[i]
-        end   = peaks[i + 1]
-        reps.append((int(start), int(end)))
+    for bottom in bottoms:
+        before = tops[tops < bottom]
+        after  = tops[tops > bottom]
+        start  = int(before[-1]) if len(before) > 0 else 0
+        end    = int(after[0])   if len(after)  > 0 else T - 1
+        if end > start + 10:
+            reps.append((start, end))
 
-    return reps
+    if not reps:
+        return [(0, T - 1)]
+
+    reps   = sorted(set(reps))
+    merged = [reps[0]]
+    for r in reps[1:]:
+        if r[0] < merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], r[1]))
+        else:
+            merged.append(r)
+    return merged
 
 
-def _interpolate_missing(signal: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-    """Linear interpolation over frames where pose was not detected."""
-    result = signal.copy()
-    indices = np.arange(len(signal))
-    valid_indices = indices[valid_mask]
-    valid_values  = signal[valid_mask]
-    result = np.interp(indices, valid_indices, valid_values)
-    return result
-
-
-# ── Smoke test ────────────────────────────────────────────────────
+# ── Self-test ─────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, ".")
-    from data.dataset_loader import SquatDatasetLoader
+    # Build fake landmarks [T, 33, 4] with 3 clear squat cycles.
+    # Hip Y signal: standing baseline + 3 downward dips (bottoms).
+    # In image coords Y increases downward, so a squat bottom = high Y value.
+    T   = 300
+    t   = np.linspace(0, 1, T)
 
-    loader = SquatDatasetLoader(sources_filter=["synthetic"], max_per_source=5)
+    # Three squat bottoms centred at frames 75, 150, 225
+    hip_y = (
+        0.5                                      # standing baseline
+        + 0.25 * np.exp(-((t - 0.25) ** 2) / (2 * 0.004))  # bottom 1
+        + 0.25 * np.exp(-((t - 0.50) ** 2) / (2 * 0.004))  # bottom 2
+        + 0.25 * np.exp(-((t - 0.75) ** 2) / (2 * 0.004))  # bottom 3
+    ).astype(np.float32)
 
-    for sample in loader:
-        reps = segment_reps(sample["landmarks"], fps=24.0)
-        T    = sample["landmarks"].shape[0]
-        print(f"  {sample['video_id']} | frames={T} | reps_found={len(reps)+1} | boundaries={reps[:3]}")
+    # Pack into [T, 33, 4] — only hip channels matter
+    landmarks = np.zeros((T, 33, 4), dtype=np.float32)
+    landmarks[:, _LEFT_HIP,  1] = hip_y
+    landmarks[:, _RIGHT_HIP, 1] = hip_y
+
+    reps = segment_reps(landmarks, smooth_sigma=3.0, min_distance=30)
+    print(f"Detected {len(reps)} rep(s): {reps}")
+
+    assert len(reps) == 3, f"Expected 3 reps, got {len(reps)}"
+    print("PASS")
