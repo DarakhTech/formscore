@@ -4,17 +4,15 @@ Biomechanical feature engineering for FormScore.
 
 Consumes normalized [T, 33, 4] landmarks and produces an [T, 8] feature
 matrix:
-  0  knee_angle_left
-  1  knee_angle_right
-  2  hip_angle_left
-  3  hip_angle_right
-  4  spine_tilt
-  5  knee_velocity_left    
-  6  knee_velocity_right   
-  7  knee_symmetry         
+  0-4  five joint angles  (exercise-specific; see configs/exercises.py)
+  5    angle_velocity_left   (d/dt of col 0)
+  6    angle_velocity_right  (d/dt of col 1)
+  7    angle_symmetry        (|col 0 - col 1|)
 """
 
 import numpy as np
+
+from configs.exercises import EXERCISE_CONFIGS
 
 # ── MediaPipe landmark indices ────────────────────────────
 _L_SHOULDER = 11
@@ -51,6 +49,34 @@ def _angle_vec(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> np.ndarray:
     cosine = dot / (norm_a * norm_c + 1e-8)             # [T]
     cosine = np.clip(cosine, -1.0, 1.0)                 # domain guard
     return np.degrees(np.arccos(cosine))                # [T]
+
+
+def compute_angles_for_exercise(landmarks: np.ndarray, exercise: str = "squat") -> np.ndarray:
+    """
+    Compute 5 joint angles for a given exercise using its angle_joints config.
+
+    Parameters
+    ----------
+    landmarks : np.ndarray [T, 33, 4]
+    exercise  : str  key in EXERCISE_CONFIGS
+
+    Returns
+    -------
+    np.ndarray [T, 5]
+        Columns 0-3: four explicit triplet angles.
+        Column  4:   mean of cols 0 and 1 (composite signal per exercise).
+    """
+    cfg = EXERCISE_CONFIGS[exercise]
+    xyz = landmarks[:, :, :3]   # [T, 33, 3]
+
+    triplets = cfg["angle_joints"]   # list of 4 (a, b, c) tuples
+    a0 = _angle_vec(xyz[:, triplets[0][0]], xyz[:, triplets[0][1]], xyz[:, triplets[0][2]])
+    a1 = _angle_vec(xyz[:, triplets[1][0]], xyz[:, triplets[1][1]], xyz[:, triplets[1][2]])
+    a2 = _angle_vec(xyz[:, triplets[2][0]], xyz[:, triplets[2][1]], xyz[:, triplets[2][2]])
+    a3 = _angle_vec(xyz[:, triplets[3][0]], xyz[:, triplets[3][1]], xyz[:, triplets[3][2]])
+    a4 = (a0 + a1) / 2.0   # composite: spine_tilt / body_alignment / overhead_ext
+
+    return np.stack([a0, a1, a2, a3, a4], axis=1)  # [T, 5]
 
 
 def compute_angles(landmarks: np.ndarray) -> np.ndarray:
@@ -113,31 +139,28 @@ def compute_symmetry_depth(angles: np.ndarray) -> np.ndarray:
     return knee_symmetry[:, np.newaxis]                   # [T, 1]
 
 
-def build_feature_matrix(landmarks: np.ndarray) -> np.ndarray:
+def build_feature_matrix(landmarks: np.ndarray, exercise: str = "squat") -> np.ndarray:
     """
     Full [T, 8] feature matrix from normalized [T, 33, 4] landmarks.
 
     Feature columns:
-      0  knee_angle_left
-      1  knee_angle_right
-      2  hip_angle_left
-      3  hip_angle_right
-      4  spine_tilt
-      5  knee_velocity_left
-      6  knee_velocity_right
-      7  knee_symmetry
+      0-4  five joint angles  (exercise-specific)
+      5    angle_velocity_left   (d/dt of col 0)
+      6    angle_velocity_right  (d/dt of col 1)
+      7    angle_symmetry        (|col 0 - col 1|)
 
     Parameters
     ----------
     landmarks : np.ndarray [T, 33, 4]  normalized landmarks
+    exercise  : str  key in EXERCISE_CONFIGS (default "squat")
 
     Returns
     -------
     np.ndarray [T, 8]
     """
-    angles   = compute_angles(landmarks)           # [T, 5]
-    velocity = compute_velocity(angles)            # [T, 2]
-    symmetry = compute_symmetry_depth(angles)      # [T, 1]
+    angles   = compute_angles_for_exercise(landmarks, exercise)  # [T, 5]
+    velocity = compute_velocity(angles)                          # [T, 2]
+    symmetry = compute_symmetry_depth(angles)                    # [T, 1]
 
     return np.concatenate([angles, velocity, symmetry], axis=1)  # [T, 8]
 

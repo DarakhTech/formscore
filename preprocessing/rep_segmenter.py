@@ -3,9 +3,9 @@ preprocessing/rep_segmenter.py
 
 Standalone rep segmenter for FormScore.
 
-Extracts hip midpoint Y from raw landmarks, smooths with a Gaussian
-filter, finds squat bottoms (local maxima) and standing tops (local
-minima), and pairs them into (start, end) rep boundaries.
+Extracts a joint midpoint Y from raw landmarks, smooths with a Gaussian
+filter, finds rep extremes (peaks or valleys depending on exercise), and
+pairs them into (start, end) rep boundaries.
 
 Input:  raw (unnormalized) landmarks [T, 33, 4]
 Output: list of (start, end) frame-index tuples, one per rep
@@ -15,24 +15,26 @@ import numpy as np
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
 
-_LEFT_HIP  = 23
-_RIGHT_HIP = 24
+from configs.exercises import EXERCISE_CONFIGS
 
 
 def segment_reps(
     landmarks_raw: np.ndarray,
+    exercise: str = "squat",
     smooth_sigma: float = 3.0,
     min_distance: int = 30,
 ) -> list[tuple[int, int]]:
     """
-    Segment squat reps from raw landmark array.
+    Segment exercise reps from raw landmark array.
 
     Parameters
     ----------
     landmarks_raw : np.ndarray [T, 33, 4]
         Raw (unnormalized) MediaPipe landmarks.
+    exercise      : str
+        Key in EXERCISE_CONFIGS (default "squat").
     smooth_sigma  : float
-        Gaussian smoothing sigma applied to hip Y trajectory.
+        Gaussian smoothing sigma applied to joint Y trajectory.
     min_distance  : int
         Minimum frame distance between detected peaks.
 
@@ -41,19 +43,27 @@ def segment_reps(
     list of (start, end) tuples — one per detected rep.
     Returns [(0, T-1)] if no reps are detected.
     """
+    cfg   = EXERCISE_CONFIGS[exercise]
+    lm_l  = cfg["seg_landmark_l"]
+    lm_r  = cfg["seg_landmark_r"]
+    direction = cfg["seg_direction"]   # "peak" or "valley"
+
     T = landmarks_raw.shape[0]
 
-    hip_mid_y = (
-        landmarks_raw[:, _LEFT_HIP,  1] +
-        landmarks_raw[:, _RIGHT_HIP, 1]
+    joint_mid_y = (
+        landmarks_raw[:, lm_l, 1] +
+        landmarks_raw[:, lm_r, 1]
     ) / 2.0                                         # [T]
 
-    smoothed     = gaussian_filter1d(hip_mid_y, sigma=smooth_sigma)
+    smoothed     = gaussian_filter1d(joint_mid_y, sigma=smooth_sigma)
     signal_range = smoothed.max() - smoothed.min()
     prominence   = signal_range * 0.30
 
-    bottoms, _ = find_peaks( smoothed, distance=min_distance, prominence=prominence)
-    tops,    _ = find_peaks(-smoothed, distance=min_distance, prominence=prominence)
+    # direction="valley": wrists go UP (low Y) at top of press → negate to find valleys
+    search_signal = smoothed if direction == "peak" else -smoothed
+
+    bottoms, _ = find_peaks( search_signal, distance=min_distance, prominence=prominence)
+    tops,    _ = find_peaks(-search_signal, distance=min_distance, prominence=prominence)
 
     if len(bottoms) == 0 or len(tops) == 0:
         return [(0, T - 1)]
@@ -82,6 +92,8 @@ def segment_reps(
 
 # ── Self-test ─────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     # Build fake landmarks [T, 33, 4] with 3 clear squat cycles.
     # Hip Y signal: standing baseline + 3 downward dips (bottoms).
     # In image coords Y increases downward, so a squat bottom = high Y value.
@@ -98,10 +110,10 @@ if __name__ == "__main__":
 
     # Pack into [T, 33, 4] — only hip channels matter
     landmarks = np.zeros((T, 33, 4), dtype=np.float32)
-    landmarks[:, _LEFT_HIP,  1] = hip_y
-    landmarks[:, _RIGHT_HIP, 1] = hip_y
+    landmarks[:, 23, 1] = hip_y   # left hip
+    landmarks[:, 24, 1] = hip_y   # right hip
 
-    reps = segment_reps(landmarks, smooth_sigma=3.0, min_distance=30)
+    reps = segment_reps(landmarks, exercise="squat", smooth_sigma=3.0, min_distance=30)
     print(f"Detected {len(reps)} rep(s): {reps}")
 
     assert len(reps) == 3, f"Expected 3 reps, got {len(reps)}"

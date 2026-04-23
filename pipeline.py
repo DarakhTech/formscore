@@ -58,11 +58,13 @@ from mediapipe.tasks.python.vision import (
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 
+from configs.exercises import EXERCISE_CONFIGS
+from data.synthetic_loader import load_synthetic_exercise
 from preprocessing.normalizer import normalize
 from preprocessing.feature_engineer import build_feature_matrix, resample_to_60
 from explainability.shap_explainer import FormScoreExplainer, FEATURE_NAMES
 from explainability.feedback_lookup import get_feedback
-from modeling.evaluate import _build_dataset
+from modeling.load_model import get_predict_fn
 
 # ── MediaPipe model ───────────────────────────────────────
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "pose_landmarker.task")
@@ -127,37 +129,43 @@ def _extract_landmarks(video_path: str) -> np.ndarray:
 # ── Stage 2: Rep segmentation ─────────────────────────────
 
 def _segment_reps(landmarks_raw: np.ndarray,
+                  exercise: str = "squat",
                   smooth_sigma: float = 3.0,
                   min_distance: int = 30) -> list[tuple[int, int]]:
     """
     Detect rep boundaries from RAW (unnormalized) landmarks.
-    Hip y in image coords increases downward — squat bottom = peak.
+    Uses exercise-specific landmark indices and direction from EXERCISE_CONFIGS.
     """
-    hip_mid_y = (landmarks_raw[:, 23, 1] + landmarks_raw[:, 24, 1]) / 2.0
-    smoothed  = gaussian_filter1d(hip_mid_y, sigma=smooth_sigma)
+    cfg       = EXERCISE_CONFIGS[exercise]
+    lm_l      = cfg["seg_landmark_l"]
+    lm_r      = cfg["seg_landmark_r"]
+    direction = cfg["seg_direction"]
 
-    signal_range = smoothed.max() - smoothed.min()
-    prominence   = signal_range * 0.30   # 30% of range
+    joint_mid_y = (landmarks_raw[:, lm_l, 1] + landmarks_raw[:, lm_r, 1]) / 2.0
+    smoothed    = gaussian_filter1d(joint_mid_y, sigma=smooth_sigma)
 
-    bottoms, _ = find_peaks( smoothed, distance=min_distance, prominence=prominence)
-    tops,    _ = find_peaks(-smoothed, distance=min_distance, prominence=prominence)
+    signal_range  = smoothed.max() - smoothed.min()
+    prominence    = signal_range * 0.30
 
-    if len(bottoms) == 0:
-        return [(0, len(hip_mid_y) - 1)]
-    if len(tops) == 0:
-        return [(0, len(hip_mid_y) - 1)]
+    search_signal = smoothed if direction == "peak" else -smoothed
+
+    bottoms, _ = find_peaks( search_signal, distance=min_distance, prominence=prominence)
+    tops,    _ = find_peaks(-search_signal, distance=min_distance, prominence=prominence)
+
+    if len(bottoms) == 0 or len(tops) == 0:
+        return [(0, len(joint_mid_y) - 1)]
 
     reps = []
     for bottom in bottoms:
         before = tops[tops < bottom]
         after  = tops[tops > bottom]
         start  = int(before[-1]) if len(before) > 0 else 0
-        end    = int(after[0])   if len(after)  > 0 else len(hip_mid_y) - 1
+        end    = int(after[0])   if len(after)  > 0 else len(joint_mid_y) - 1
         if end > start + 10:
             reps.append((start, end))
 
     if not reps:
-        return [(0, len(hip_mid_y) - 1)]
+        return [(0, len(joint_mid_y) - 1)]
 
     reps   = sorted(set(reps))
     merged = [reps[0]]
@@ -178,27 +186,41 @@ def _stub_model(X: np.ndarray) -> np.ndarray:
     return np.clip(score, 0.0, 1.0).astype(np.float32)
 
 
-def _load_real_model():
-    """Return predict_fn from the trained BiLSTM, or None if checkpoint missing."""
+def _load_exercise_model(exercise: str):
+    """Return predict_fn for the exercise checkpoint, or None if missing."""
+    model_path = EXERCISE_CONFIGS[exercise]["model_path"]
     try:
-        from modeling.load_model import predict_fn
-        # Trigger the load now so errors surface at init time, not inference time
-        predict_fn(np.zeros((1, 60, 8), dtype=np.float32))
-        return predict_fn
+        fn = get_predict_fn(model_path)
+        fn(np.zeros((1, 60, 8), dtype=np.float32))   # warm up / validate
+        return fn
     except FileNotFoundError:
         return None
 
 
-def _load_background(n: int = 50, seed: int = 42) -> np.ndarray:
+def _load_background(exercise: str = "squat", n: int = 50, seed: int = 42) -> np.ndarray:
     """
-    Sample n real reps from the synthetic dataset as SHAP background.
+    Sample n real reps from the exercise synthetic dataset as SHAP background.
     Falls back to random noise if the dataset can't be loaded.
     """
     try:
-        X, _, _ = _build_dataset()
-        rng     = np.random.default_rng(seed)
-        idx     = rng.choice(len(X), size=min(n, len(X)), replace=False)
-        return X[idx].astype(np.float32)
+        from preprocessing.normalizer import normalize as _norm
+        clips = load_synthetic_exercise(exercise)
+        X_list = []
+        for clip in clips:
+            norm_lm  = _norm(clip["landmarks"])
+            features = build_feature_matrix(norm_lm, exercise=exercise)
+            for start, end in clip["reps"]:
+                rep = features[start:end + 1]
+                if len(rep) >= 5:
+                    X_list.append(resample_to_60(rep))
+                    if len(X_list) >= n * 4:   # collect enough to sample from
+                        break
+            if len(X_list) >= n * 4:
+                break
+        X   = np.stack(X_list).astype(np.float32)
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(X), size=min(n, len(X)), replace=False)
+        return X[idx]
     except Exception:
         rng = np.random.default_rng(seed)
         return rng.random((n, 60, 8)).astype(np.float32)
@@ -225,21 +247,21 @@ class FormScorePipeline:
                  background: np.ndarray = None,
                  exercise: str = "squat"):
 
+        self.exercise = exercise
+
         if model_fn is not None:
             self.model_fn = model_fn
         else:
-            real = _load_real_model()
+            real = _load_exercise_model(exercise)
             if real is not None:
-                print("  [pipeline] Using trained BiLSTM scorer.")
+                print(f"  [pipeline] Loaded checkpoint for '{exercise}'.")
                 self.model_fn = real
             else:
-                print("  [pipeline] Checkpoint not found — using stub scorer.")
+                print(f"  [pipeline] Checkpoint not found for '{exercise}' — using stub scorer.")
                 self.model_fn = _stub_model
 
-        self.exercise = exercise
-
         if background is None:
-            background = _load_background(n=50)
+            background = _load_background(exercise=exercise, n=50)
 
         self.explainer = FormScoreExplainer(
             self.model_fn, background, model_type="kernel"
@@ -271,7 +293,7 @@ class FormScorePipeline:
         landmarks_norm = normalize(landmarks_raw)           # [T, 33, 4]
 
         # ── Stage 3: Rep segmentation ─────────────────────
-        reps = _segment_reps(landmarks_raw)
+        reps = _segment_reps(landmarks_raw, exercise=self.exercise)
 
         rep_results  = []
         latencies_ms = []
@@ -285,8 +307,8 @@ class FormScorePipeline:
                 continue
 
             # ── Stage 4: Feature engineering ─────────────
-            feat    = build_feature_matrix(rep_lm)   # [rep_T, 8]
-            feat_60 = resample_to_60(feat)           # [60, 8]
+            feat    = build_feature_matrix(rep_lm, exercise=self.exercise)  # [rep_T, 8]
+            feat_60 = resample_to_60(feat)                                  # [60, 8]
 
             # ── Stage 5a: Scoring ─────────────────────────
             score = float(self.model_fn(feat_60[np.newaxis])[0])
@@ -295,7 +317,7 @@ class FormScorePipeline:
             explanation = self.explainer.explain(feat_60)
 
             # ── Stage 5c: Feedback ────────────────────────
-            feedback = get_feedback(explanation, form_score=score)
+            feedback = get_feedback(explanation, form_score=score, exercise=self.exercise)
 
             t_rep_ms = (time.perf_counter() - t_rep_start) * 1000
             latencies_ms.append(t_rep_ms)

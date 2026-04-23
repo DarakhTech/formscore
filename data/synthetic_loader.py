@@ -1,10 +1,10 @@
 """
 data/synthetic_loader.py
 
-Loads synthetic_dataset squat JSONs and produces:
+Loads synthetic_dataset exercise JSONs and produces:
   - landmarks [T, 33, 4]  compatible with normalizer.py
   - form_score [T]         computed from quaternion joint angles
-  - rep boundaries         via hip_mid_y peak detection
+  - rep boundaries         via joint midpoint peak/valley detection
 """
 
 import json
@@ -13,6 +13,10 @@ import pathlib
 import numpy as np
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
+
+from configs.exercises import EXERCISE_CONFIGS
+
+_SYNTHETIC_ROOT = pathlib.Path(__file__).parent / "real-time-exercise-recognition-dataset" / "synthetic_dataset" / "synthetic_dataset"
 
 ARMATURE_TO_MP = {
     "left_shoulder":  11,
@@ -83,23 +87,26 @@ def _parse_frame(annotation: dict):
     hip_mid_y  = (lm[23, 1] + lm[24, 1]) / 2.0
     return lm, form_score, hip_mid_y
 
-def _segment_reps(hip_mid_y: np.ndarray,
+def _segment_reps(joint_mid_y: np.ndarray,
+                  direction: str = "peak",
                   smooth_sigma: float = 2.0,
                   min_distance: int = 15) -> list:
-    smoothed = gaussian_filter1d(hip_mid_y, sigma=smooth_sigma)
-    bottoms, _ = find_peaks(smoothed, distance=min_distance, prominence=3.0)
+    smoothed     = gaussian_filter1d(joint_mid_y, sigma=smooth_sigma)
+    search_signal = smoothed if direction == "peak" else -smoothed
+
+    bottoms, _ = find_peaks( search_signal, distance=min_distance, prominence=3.0)
     if len(bottoms) == 0:
         return []
-    tops, _ = find_peaks(-smoothed, distance=min_distance, prominence=3.0)
+    tops, _    = find_peaks(-search_signal, distance=min_distance, prominence=3.0)
     if len(tops) == 0:
-        return [(0, len(hip_mid_y) - 1)]
+        return [(0, len(joint_mid_y) - 1)]
 
     reps = []
     for bottom in bottoms:
         before = tops[tops < bottom]
         after  = tops[tops > bottom]
         start  = int(before[-1]) if len(before) > 0 else 0
-        end    = int(after[0])   if len(after)  > 0 else len(hip_mid_y) - 1
+        end    = int(after[0])   if len(after)  > 0 else len(joint_mid_y) - 1
         if end > start:
             reps.append((start, end))
 
@@ -112,11 +119,17 @@ def _segment_reps(hip_mid_y: np.ndarray,
             merged.append(r)
     return merged
 
-def load_synthetic_squats(squat_dir: str,
-                           min_frames: int = 30,
-                           max_bad_frame_ratio: float = 0.3) -> list:
-    squat_path = pathlib.Path(squat_dir)
-    json_files = sorted(squat_path.glob("*.json"))
+def _load_from_dir(dir_path: str,
+                   exercise: str = "squat",
+                   min_frames: int = 30,
+                   max_bad_frame_ratio: float = 0.3) -> list:
+    cfg       = EXERCISE_CONFIGS[exercise]
+    lm_l      = cfg["seg_landmark_l"]
+    lm_r      = cfg["seg_landmark_r"]
+    direction = cfg["seg_direction"]
+
+    ex_path    = pathlib.Path(dir_path)
+    json_files = sorted(ex_path.glob("*.json"))
     clips      = []
     skipped    = {"too_short": 0, "too_occluded": 0, "no_reps": 0}
 
@@ -131,16 +144,16 @@ def load_synthetic_squats(squat_dir: str,
             skipped["too_short"] += 1
             continue
 
-        all_lm, all_scores, all_hipy = [], [], []
+        all_lm, all_scores, all_jy = [], [], []
         for ann in annotations:
-            lm, score, hip_y = _parse_frame(ann)
+            lm, score, _ = _parse_frame(ann)
             all_lm.append(lm)
             all_scores.append(score)
-            all_hipy.append(hip_y)
+            all_jy.append(float((lm[lm_l, 1] + lm[lm_r, 1]) / 2.0))
 
         landmarks   = np.stack(all_lm)
         form_scores = np.array(all_scores, dtype=np.float32)
-        hip_mid_y   = np.array(all_hipy,   dtype=np.float32)
+        joint_mid_y = np.array(all_jy,     dtype=np.float32)
 
         bad_ratio = (form_scores < 0).mean()
         if bad_ratio > max_bad_frame_ratio:
@@ -154,13 +167,14 @@ def load_synthetic_squats(squat_dir: str,
             form_scores[bad_idx] = np.interp(bad_idx, good_idx,
                                              form_scores[good_idx])
 
-        reps = _segment_reps(hip_mid_y)
+        reps = _segment_reps(joint_mid_y, direction=direction)
         if len(reps) == 0:
             skipped["no_reps"] += 1
             continue
 
         clips.append({
             "video_id":    jf.stem,
+            "exercise":    exercise,
             "landmarks":   landmarks,
             "form_scores": form_scores,
             "reps":        reps,
@@ -172,10 +186,44 @@ def load_synthetic_squats(squat_dir: str,
             "n_reps":   len(reps),
         })
 
-    print(f"\n=== synthetic_loader ===")
+    print(f"\n=== synthetic_loader [{exercise}] ===")
     print(f"  Loaded  : {len(clips)} clips")
     print(f"  Skipped : {skipped}")
     total_reps = sum(c["n_reps"] for c in clips)
     print(f"  Total reps detected : {total_reps}")
-    print(f"  Avg reps/clip       : {total_reps/len(clips):.1f}" if clips else "")
+    if clips:
+        print(f"  Avg reps/clip       : {total_reps/len(clips):.1f}")
     return clips
+
+
+_BASE_DIR = "data/real-time-exercise-recognition-dataset/synthetic_dataset/synthetic_dataset"
+
+
+def load_synthetic_exercise(exercise: str = "squat",
+                             base_dir: str = None,
+                             min_frames: int = 30,
+                             max_bad_frame_ratio: float = 0.3) -> list:
+    synthetic_dir = EXERCISE_CONFIGS[exercise]["synthetic_dir"]
+    base          = base_dir if base_dir else _BASE_DIR
+    dir_path      = f"{base}/{synthetic_dir}"
+    return _load_from_dir(dir_path, exercise, min_frames, max_bad_frame_ratio)
+
+
+def load_synthetic_squats(squat_dir: str = None) -> list:
+    if squat_dir:
+        return _load_from_dir(squat_dir, exercise="squat")
+    return load_synthetic_exercise("squat")
+
+
+def load_all_exercises(min_frames: int = 30,
+                       max_bad_frame_ratio: float = 0.3) -> list:
+    all_clips = []
+    for exercise in EXERCISE_CONFIGS:
+        clips = load_synthetic_exercise(exercise,
+                                        min_frames=min_frames,
+                                        max_bad_frame_ratio=max_bad_frame_ratio)
+        all_clips.extend(clips)
+
+    total_reps = sum(c["n_reps"] for c in all_clips)
+    print(f"\n=== load_all_exercises: {len(all_clips)} clips, {total_reps} reps total ===")
+    return all_clips

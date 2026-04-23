@@ -4,19 +4,27 @@
 import sys, argparse, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from pipeline import FormScorePipeline
+from configs.exercises import EXERCISE_CONFIGS
 from explainability.feedback_lookup import FEEDBACK_TEMPLATES
 
 
 def main():
-    p = argparse.ArgumentParser(description="Score a squat video with FormScore BiLSTM.")
-    p.add_argument("--video", required=True, help="Path to squat video (.mp4 / .mov)")
+    p = argparse.ArgumentParser(description="Score an exercise video with FormScore BiLSTM.")
+    p.add_argument("--video", required=True, help="Path to exercise video (.mp4 / .mov)")
+    p.add_argument(
+        "--exercise",
+        choices=["squat", "pushup", "shoulder_press"],
+        default="squat",
+        help="Exercise type (default: squat)",
+    )
     args = p.parse_args()
 
-    pipe   = FormScorePipeline()
+    display_name = EXERCISE_CONFIGS[args.exercise]["display_name"]
+    pipe   = FormScorePipeline(exercise=args.exercise)
     result = pipe.run(args.video)
 
     rule = "──────────────────────────"
-    print(f"\nFormScore — squat analysis")
+    print(f"\nFormScore — {display_name} analysis")
     print(rule)
     print(f"Video: {result['video']}")
     print(f"Reps detected: {result['n_reps']}\n")

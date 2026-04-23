@@ -1,13 +1,15 @@
 """
 modeling/load_model.py
 
-Load the best full-dataset BiLSTM checkpoint and expose a predict_fn.
+Load BiLSTM checkpoints and expose predict functions.
 
 Usage
 -----
-    from modeling.load_model import predict_fn
+    from modeling.load_model import predict_fn, get_predict_fn
 
-    preds = predict_fn(X)   # X: [N, 60, 8] numpy  →  preds: [N] numpy
+    preds = predict_fn(X)                          # default full checkpoint
+    fn    = get_predict_fn("checkpoints/lstm_squat.pt")
+    preds = fn(X)   # X: [N, 60, 8] numpy  →  preds: [N] numpy
 """
 
 import pathlib
@@ -44,14 +46,44 @@ def predict_fn(X: np.ndarray) -> np.ndarray:
     Parameters
     ----------
     X : np.ndarray [N, 60, 8]
-        Preprocessed rep feature matrices (normalized, resampled to 60 frames).
 
     Returns
     -------
-    np.ndarray [N]
-        Predicted form scores in [0, 1].
+    np.ndarray [N]  predicted form scores in [0, 1]
     """
     model = _load()
     with torch.no_grad():
         x_t = torch.tensor(X, dtype=torch.float32).to(_device)
         return model(x_t).cpu().numpy()
+
+
+def get_predict_fn(model_path: str):
+    """
+    Load a BiLSTM checkpoint from an explicit path and return a predict_fn.
+
+    Parameters
+    ----------
+    model_path : str  path to .pt checkpoint
+
+    Returns
+    -------
+    callable  [N, 60, 8] → [N] numpy predict function
+
+    Raises
+    ------
+    FileNotFoundError if the checkpoint does not exist
+    """
+    ckpt = pathlib.Path(model_path)
+    if not ckpt.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+
+    m = LSTMScorer().to(_device)
+    m.load_state_dict(torch.load(ckpt, map_location=_device, weights_only=True))
+    m.eval()
+
+    def _fn(X: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            x_t = torch.tensor(X, dtype=torch.float32).to(_device)
+            return m(x_t).cpu().numpy()
+
+    return _fn
