@@ -10,6 +10,8 @@ a list of feedback strings ordered by severity.
 import numpy as np
 from typing import Optional
 
+from configs.exercises import EXERCISE_CONFIGS
+
 # ── Feedback templates per feature ───────────────────────
 # Each entry: (threshold, feedback_string)
 # threshold = min fault_vector value to trigger this feedback
@@ -61,7 +63,8 @@ SCORE_FEEDBACK = [
 
 def get_feedback(explanation: dict,
                  form_score: float,
-                 max_cues: int = 3) -> dict:
+                 max_cues: int = 3,
+                 exercise: str = "squat") -> dict:
     """
     Generate human-readable feedback from a SHAP explanation.
 
@@ -97,10 +100,16 @@ def get_feedback(explanation: dict,
         "knee_symmetry",
     ]
 
+    exercise_feedback_map = EXERCISE_CONFIGS.get(exercise, {}).get("feedback_map", {})
+
     # Collect triggered cues sorted by fault severity
     cues = []
     for i, fname in enumerate(feature_names):
         severity = fault_vector[i]
+        # Exercise-specific override: single string, triggers at any severity > 0
+        if fname in exercise_feedback_map and severity > 0:
+            cues.append((severity, exercise_feedback_map[fname]))
+            continue
         templates = FEEDBACK_TEMPLATES.get(fname, [])
         # Pick highest triggered threshold
         triggered = None
