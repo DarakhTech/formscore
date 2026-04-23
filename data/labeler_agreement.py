@@ -82,6 +82,7 @@ def krippendorff_alpha(data: np.ndarray, level: str = "ordinal") -> float:
 
 
 def compute_agreement(csv_path: str) -> None:
+    """Load a labeling CSV and print Krippendorff alpha and per-dimension agreement."""
     df = pd.read_csv(csv_path)
 
     print(f"\nLoaded {len(df)} rows, {df['video_id'].nunique()} unique videos\n")

@@ -24,6 +24,8 @@ def _extract_features(X: np.ndarray) -> np.ndarray:
 
 
 class RFBaseline:
+    """Random Forest baseline using per-feature summary statistics as input."""
+
     def __init__(self, n_estimators: int = 100, random_state: int = 42):
         self._rf = RandomForestRegressor(
             n_estimators=n_estimators,
