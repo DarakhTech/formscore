@@ -98,15 +98,25 @@ def _extract_landmarks(video_path: str) -> np.ndarray:
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video: {video_path}")
 
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_skip = max(1, round(source_fps / 30))
+    if frame_skip > 1:
+        print(f"  [pipeline] {source_fps:.1f}fps → processing every {frame_skip}nd frame (~30fps)")
+
     all_landmarks = []
+    frame_idx = 0
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
+        frame_idx += 1
+        if frame_idx % frame_skip != 0:
+            continue
+
         rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        ts_ms    = int(cap.get(cv2.CAP_PROP_POS_MSEC))
+        ts_ms    = int((frame_idx / source_fps) * 1000)
         result   = landmarker.detect_for_video(mp_image, ts_ms)
 
         if result.pose_landmarks and len(result.pose_landmarks) > 0:
