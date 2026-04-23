@@ -23,6 +23,7 @@ from modeling.train_loop import TrainingLoop
 
 
 class LSTMScorer(nn.Module):
+    """Bidirectional two-layer LSTM form scorer with sigmoid output in [0, 1]."""
 
     def __init__(self, in_features: int = 8, dropout: float = 0.3):
         super().__init__()

@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 
 class BaseTrainer:
+    """Shared trainer for CNNScorer and LSTMScorer with explicit train/val splits."""
 
     def __init__(
         self,

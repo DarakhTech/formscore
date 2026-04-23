@@ -23,6 +23,7 @@ CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 
 class TrainingLoop:
+    """Training loop with Adam, cosine LR decay, early stopping, and gradient clipping."""
 
     def __init__(
         self,

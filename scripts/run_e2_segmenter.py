@@ -16,8 +16,6 @@ import sys
 import pathlib
 import numpy as np
 import pandas as pd
-from collections import defaultdict
-
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from data.dataset_loader import load_real_squats
