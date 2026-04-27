@@ -25,15 +25,17 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python.vision import PoseLandmarkerOptions, PoseLandmarker, RunningMode
 import numpy as np
+import matplotlib.pyplot as plt
 import streamlit as st
 import streamlit.components.v1 as components
 from scipy.ndimage import gaussian_filter1d
 from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
 
 from configs.exercises import EXERCISE_CONFIGS
+from data.synthetic_loader import load_synthetic_exercise
 from explainability.feedback_lookup import get_feedback
-from explainability.shap_explainer import FEATURE_NAMES
-from pipeline import FormScorePipeline
+from explainability.shap_explainer import FEATURE_NAMES, FormScoreExplainer
+from modeling.load_model import get_model_and_predict_fn
 from preprocessing.feature_engineer import build_feature_matrix, resample_to_60
 from preprocessing.normalizer import normalize
 from preprocessing.rep_segmenter import segment_reps
@@ -63,6 +65,12 @@ SKELETON_LINES = [
     (_L_KNEE,     _L_ANKLE),
     (_R_KNEE,     _R_ANKLE),
 ]
+try:
+    from mediapipe.python.solutions.pose_connections import POSE_CONNECTIONS as MP_POSE_CONNECTIONS
+    POSE_CONNECTIONS = [(int(a), int(b)) for a, b in MP_POSE_CONNECTIONS]
+except Exception:
+    # Fallback: key full-body edges for environments without mediapipe.solutions
+    POSE_CONNECTIONS = SKELETON_LINES
 
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -71,6 +79,11 @@ MODEL_PATH = os.path.join(
 
 MIN_BUFFER_FOR_SCORING = 90   # frames (~3 s at 30 fps)
 MIN_REP_FRAMES         = 20   # discard spurious short segments
+REP_END_STABILITY_CHECKS = 2
+REP_END_TRAILING_MARGIN = 12  # frames; treat very recent boundaries as moving
+PROCESSING_ALERT_HOLD_S = 1.5
+STILLNESS_WINDOW = 20
+STILLNESS_STD_THRESHOLD = 0.0035
 
 # BGR colors
 JOINT_COLORS = {
@@ -97,54 +110,55 @@ def _log(entry: dict) -> None:
 # ─── Model loading ─────────────────────────────────────────────────────────────
 
 @st.cache_resource
-def load_pipeline(exercise: str) -> FormScorePipeline:
-    """Load pipeline and patch the SHAP explainer to nsamples=30 for speed."""
-    p = FormScorePipeline(exercise=exercise)
+def load_lstm_model(exercise: str):
+    """Load raw nn.Module and numpy predict wrapper once per exercise."""
+    model_path = EXERCISE_CONFIGS[exercise]["model_path"]
+    return get_model_and_predict_fn(model_path)
 
-    _kernel = p.explainer.explainer   # shap.KernelExplainer
 
-    def _fast_explain(rep: np.ndarray) -> dict:
-        if rep.ndim == 2:
-            rep = rep[np.newaxis]
-        raw = _kernel.shap_values(rep.reshape(1, -1), nsamples=30)
-        shap_matrix = np.array(raw).reshape(60, 8)
-        fault_vector = np.abs(shap_matrix).mean(axis=0)
-        top_idx = int(np.argmax(fault_vector))
-        frame_peak = int(np.argmax(np.abs(shap_matrix[:, top_idx])))
-        return {
-            "shap_values":   shap_matrix,
-            "fault_vector":  fault_vector,
-            "top_fault":     FEATURE_NAMES[top_idx],
-            "top_fault_idx": top_idx,
-            "frame_peak":    frame_peak,
-        }
+@st.cache_resource
+def load_shap_background(exercise: str, n_reps: int = 30) -> np.ndarray:
+    """Build SHAP background [n_reps, 60, 8] from synthetic reps."""
+    clips = load_synthetic_exercise(exercise)
+    reps = []
+    for clip in clips:
+        norm_lm = normalize(clip["landmarks"])
+        features = build_feature_matrix(norm_lm, exercise=exercise)
+        for start, end in clip["reps"]:
+            rep = features[start:end + 1]
+            if len(rep) >= 5:
+                reps.append(resample_to_60(rep).astype(np.float32))
+                if len(reps) >= n_reps:
+                    return np.stack(reps).astype(np.float32)
+    if reps:
+        return np.stack(reps).astype(np.float32)
+    rng = np.random.default_rng(42)
+    return rng.random((n_reps, 60, 8)).astype(np.float32)
 
-    p.explainer.explain = _fast_explain
-    return p
+
+@st.cache_resource
+def load_gradient_explainer(exercise: str) -> FormScoreExplainer:
+    """Load cached GradientExplainer once per exercise."""
+    model, _ = load_lstm_model(exercise)
+    background = load_shap_background(exercise, n_reps=30)
+    return FormScoreExplainer(model, background, model_type="gradient")
 
 # ─── Rep scoring helper ───────────────────────────────────────────────────────
 
-def score_rep(rep_lm: np.ndarray, exercise: str, pipeline: FormScorePipeline) -> tuple:
+def score_rep(rep_lm: np.ndarray, exercise: str, predict_fn) -> tuple:
     """
-    Score one rep.
-
-    Parameters
-    ----------
-    rep_lm   : [T, 33, 4] raw landmark frames for this rep
-    exercise : exercise key
-    pipeline : loaded FormScorePipeline (provides model_fn + explainer)
+    Fast score without SHAP (~50 ms).
 
     Returns
     -------
-    (score: float, fault: str, cues: list[str], overall: str)
+    (score: float, feat60: np.ndarray [60, 8])
+    feat60 is stored in the result dict for on-demand SHAP via Analyse button.
     """
     norm_lm = normalize(rep_lm)
     feat    = build_feature_matrix(norm_lm, exercise=exercise)
     feat60  = resample_to_60(feat)
-    score   = float(pipeline.model_fn(feat60[np.newaxis])[0])
-    expl    = pipeline.explainer.explain(feat60)
-    fb      = get_feedback(expl, score, exercise=exercise)
-    return score, expl["top_fault"], fb.get("cues", []), fb.get("overall", "")
+    score   = float(predict_fn(feat60[np.newaxis])[0])
+    return score, feat60
 
 # ─── Video Processor ──────────────────────────────────────────────────────────
 
@@ -170,16 +184,19 @@ class PoseProcessor(VideoProcessorBase):
         self._skip    = 0
         self._last_lm = None
 
-        self._total_fc    = 0    # total landmark frames ever appended
-        self._stable_ends = {}   # {abs_end_frame: consecutive_stable_count}
-        self._scored_ends = set()  # abs end frames already sent for scoring
-        self._results:    list = []
+        self._total_fc     = 0    # total landmark frames ever appended
+        self._stable_ends  = {}   # {abs_end_frame: consecutive_stable_count}
+        self._scored_ends  = set()  # abs end frames already sent for scoring
+        self._scored_starts = set()  # abs start frames already sent for scoring
+        self._results:     list = []
+        self._is_processing = False  # True while score_loop is running SHAP
+        self._processing_until = 0.0
 
         self._q      = queue.Queue()
         self._worker = threading.Thread(target=self._score_loop, daemon=True)
         self._worker.start()
 
-        self.pipeline = None
+        self.predict_fn = None
         self.exercise = "squat"
         self.active   = False
 
@@ -233,10 +250,25 @@ class PoseProcessor(VideoProcessorBase):
         def pt(i):
             return (int(lm[i, 0] * w), int(lm[i, 1] * h))
 
-        for a, b in SKELETON_LINES:
-            cv2.line(img, pt(a), pt(b), (180, 180, 180), 2, cv2.LINE_AA)
+        # Full-body skeleton overlay for better tracking visibility.
+        for a, b in POSE_CONNECTIONS:
+            if (
+                a >= len(lm) or b >= len(lm)
+                or lm[a, 3] < 0.2 or lm[b, 3] < 0.2
+            ):
+                continue
+            cv2.line(img, pt(a), pt(b), (120, 120, 120), 1, cv2.LINE_AA)
 
+        # Draw all visible joints lightly.
+        for idx in range(min(len(lm), 33)):
+            if lm[idx, 3] < 0.2:
+                continue
+            cv2.circle(img, pt(idx), 3, (210, 210, 210), -1, cv2.LINE_AA)
+
+        # Keep primary coaching joints emphasized.
         for idx, color in JOINT_COLORS.items():
+            if idx >= len(lm) or lm[idx, 3] < 0.2:
+                continue
             cv2.circle(img, pt(idx), 8, color, -1, cv2.LINE_AA)
 
         return img
@@ -247,15 +279,16 @@ class PoseProcessor(VideoProcessorBase):
         with self._lock:
             buf          = np.array(list(self._lm_buf))
             exercise     = self.exercise
-            pipeline     = self.pipeline
+            predict_fn   = self.predict_fn
             total_fc     = self._total_fc
             stable_ends  = dict(self._stable_ends)
             scored_ends  = set(self._scored_ends)
+            scored_starts = set(self._scored_starts)
 
         # Absolute frame index of buf[0]
         buf_start = total_fc - len(buf)
 
-        if len(buf) < MIN_BUFFER_FOR_SCORING or pipeline is None:
+        if len(buf) < MIN_BUFFER_FOR_SCORING or predict_fn is None:
             return
 
         # Hip midpoint signal (mirrors segment_reps internals) for logging
@@ -285,8 +318,13 @@ class PoseProcessor(VideoProcessorBase):
         # Convert to absolute frame indices so stability survives buffer growth
         abs_reps = [(s + buf_start, e + buf_start) for s, e in reps_rel]
 
-        # All reps except the last are candidates — the last boundary is still moving
-        candidates = abs_reps[:-1] if len(abs_reps) > 1 else []
+        # Candidate reps: include the latest boundary once it's not too close to "now".
+        candidates = []
+        for i, (abs_s, abs_e) in enumerate(abs_reps):
+            is_last = i == (len(abs_reps) - 1)
+            if is_last and (total_fc - abs_e) < REP_END_TRAILING_MARGIN:
+                continue
+            candidates.append((abs_s, abs_e))
 
         # Update stability counts: end is "stable" if within ±5 of a known end
         new_stable: dict = {}
@@ -297,14 +335,18 @@ class PoseProcessor(VideoProcessorBase):
             else:
                 new_stable[abs_e] = 1
 
-        # Collect reps ready to score: stable ≥2 checks, not yet scored, long enough
+        # Collect reps ready to score: stable across checks, not yet scored, long enough
         to_score_rel = []
+        to_score_abs = []
         new_scored   = set(scored_ends)
+        new_scored_starts = set(scored_starts)
         for abs_s, abs_e in candidates:
             stable_key = next((k for k in new_stable if abs(abs_e - k) <= 5), None)
-            if stable_key is None or new_stable[stable_key] < 2:
+            if stable_key is None or new_stable[stable_key] < REP_END_STABILITY_CHECKS:
                 continue
             if stable_key in scored_ends:
+                continue
+            if abs_s in scored_starts:
                 continue
             if abs_e - abs_s < MIN_REP_FRAMES:
                 continue
@@ -313,7 +355,32 @@ class PoseProcessor(VideoProcessorBase):
             if rel_s < 0 or rel_e > len(buf):
                 continue
             to_score_rel.append((rel_s, rel_e))
+            to_score_abs.append((abs_s, stable_key))
             new_scored.add(stable_key)
+            new_scored_starts.add(abs_s)
+
+        # Stillness finalization for "last rep" that never gets a fixed end boundary.
+        if not to_score_rel and candidates and len(hip_mid_y) >= STILLNESS_WINDOW:
+            recent_std = float(np.std(hip_mid_y[-STILLNESS_WINDOW:]))
+            abs_s, abs_e = candidates[-1]
+            rel_s = abs_s - buf_start
+            rel_e = abs_e - buf_start
+            if (
+                recent_std <= STILLNESS_STD_THRESHOLD
+                and abs_s not in scored_starts
+                and abs_e - abs_s >= MIN_REP_FRAMES
+                and rel_s >= 0
+                and rel_e <= len(buf)
+            ):
+                to_score_rel.append((rel_s, rel_e))
+                to_score_abs.append((abs_s, abs_e))
+                new_scored.add(abs_e)
+                new_scored_starts.add(abs_s)
+                _log({
+                    "event": "rep_finalize_stillness",
+                    "segment": [int(abs_s), int(abs_e)],
+                    "recent_std": round(recent_std, 6),
+                })
 
         stable_log = [
             [abs_s, abs_e] for abs_s, abs_e in candidates
@@ -330,6 +397,7 @@ class PoseProcessor(VideoProcessorBase):
         with self._lock:
             self._stable_ends = new_stable
             self._scored_ends = new_scored
+            self._scored_starts = new_scored_starts
 
             # Sliding window: trim to 150 frames when approaching capacity
             if len(self._lm_buf) >= 290:
@@ -344,11 +412,14 @@ class PoseProcessor(VideoProcessorBase):
                 }
 
         if to_score_rel:
+            with self._lock:
+                self._processing_until = max(self._processing_until, time.time() + PROCESSING_ALERT_HOLD_S)
             self._q.put({
                 "buf":      buf,
                 "reps":     to_score_rel,
+                "reps_abs": to_score_abs,
                 "exercise": exercise,
-                "pipeline": pipeline,
+                "predict_fn": predict_fn,
             })
 
     # ── Scoring worker ─────────────────────────────────────
@@ -362,36 +433,43 @@ class PoseProcessor(VideoProcessorBase):
 
             buf      = job["buf"]
             exercise = job["exercise"]
-            pipeline = job["pipeline"]
+            predict_fn = job["predict_fn"]
+            reps_abs = job.get("reps_abs", [])
 
-            for start, end in job["reps"]:
-                rep_lm = buf[start:end]
-                if len(rep_lm) < MIN_REP_FRAMES:
-                    continue
-
-                try:
-                    score, fault, cues, overall = score_rep(rep_lm, exercise, pipeline)
-
-                    with self._lock:
-                        rep_num = len(self._results) + 1
-                        self._results.append({
-                            "rep":       rep_num,
-                            "score":     score,
-                            "top_fault": fault,
-                            "cues":      cues,
-                            "overall":   overall,
+            with self._lock:
+                self._is_processing = True
+                self._processing_until = max(self._processing_until, time.time() + PROCESSING_ALERT_HOLD_S)
+            try:
+                for i, (start, end) in enumerate(job["reps"]):
+                    rep_lm = buf[start:end]
+                    if len(rep_lm) < MIN_REP_FRAMES:
+                        continue
+                    try:
+                        score, feat60 = score_rep(rep_lm, exercise, predict_fn)
+                        abs_start = int(reps_abs[i][0]) if i < len(reps_abs) else None
+                        abs_end = int(reps_abs[i][1]) if i < len(reps_abs) else None
+                        with self._lock:
+                            rep_num = len(self._results) + 1
+                            self._results.append({
+                                "rep":   rep_num,
+                                "score": score,
+                                "feat60": feat60,
+                            })
+                            if abs_start is not None:
+                                self._scored_starts.add(abs_start)
+                            if abs_end is not None:
+                                self._scored_ends.add(abs_end)
+                        _log({
+                            "event":         "rep_scored",
+                            "rep_number":    rep_num,
+                            "score":         round(score, 4),
+                            "buffer_frames": len(buf),
                         })
-
-                    _log({
-                        "event":         "rep_scored",
-                        "rep_number":    rep_num,
-                        "score":         round(score, 4),
-                        "fault":         fault,
-                        "buffer_frames": len(buf),
-                    })
-
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+            finally:
+                with self._lock:
+                    self._is_processing = False
 
     # ── Thread-safe accessors ──────────────────────────────
 
@@ -400,6 +478,13 @@ class PoseProcessor(VideoProcessorBase):
         with self._lock:
             return list(self._results)
 
+    @property
+    def is_processing(self) -> bool:
+        with self._lock:
+            queued = self._q.qsize() > 0
+            held = time.time() < self._processing_until
+            return self._is_processing or queued or held
+
     def get_final_state(self) -> tuple:
         """Atomic snapshot of buffer + scored state for final-rep flush on Stop."""
         with self._lock:
@@ -407,6 +492,7 @@ class PoseProcessor(VideoProcessorBase):
                 np.array(list(self._lm_buf)),
                 self._total_fc,
                 set(self._scored_ends),
+                set(self._scored_starts),
             )
 
     def reset(self):
@@ -417,7 +503,9 @@ class PoseProcessor(VideoProcessorBase):
             self._last_lm     = None
             self._stable_ends = {}
             self._scored_ends = set()
+            self._scored_starts = set()
             self._results.clear()
+            self._processing_until = 0.0
 
 # ─── Score card ────────────────────────────────────────────────────────────────
 
@@ -429,13 +517,55 @@ def _score_color(score: float) -> str:
     return "#e74c3c"
 
 
-def _render_score_card(result: dict):
-    score   = result["score"]
-    color   = _score_color(score)
-    pct     = int(score * 100)
-    fault   = result["top_fault"].replace("_", " ").title()
-    cues    = result.get("cues", [])
-    cue_txt = cues[0] if cues else result.get("overall", "")
+def _ensure_analysis_state():
+    if "analysis_pending" not in st.session_state:
+        st.session_state.analysis_pending = {}
+    if "analysis_results" not in st.session_state:
+        st.session_state.analysis_results = {}
+    if "_analysis_last_rerun" not in st.session_state:
+        st.session_state._analysis_last_rerun = 0.0
+
+
+def _launch_async_analysis(rep_idx: int, rep_feat60: np.ndarray, exercise: str, score: float, explainer: FormScoreExplainer):
+    st.session_state.analysis_pending[rep_idx] = True
+    st.session_state.analysis_results[rep_idx] = {"done": False}
+
+    def run_shap(rep_lm: np.ndarray, exercise_name: str, rep_n: int, rep_score: float):
+        try:
+            expl = explainer.explain(rep_lm)
+            fb = get_feedback(expl, rep_score, exercise_name)
+            st.session_state.analysis_results[rep_n] = {
+                "explanation": expl,
+                "feedback": fb,
+                "done": True,
+            }
+        except Exception as exc:
+            st.session_state.analysis_results[rep_n] = {
+                "error": str(exc),
+                "done": True,
+            }
+        finally:
+            st.session_state.analysis_pending[rep_n] = False
+
+    thread = threading.Thread(
+        target=run_shap,
+        args=(rep_feat60, exercise, rep_idx, score),
+        daemon=True,
+    )
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        add_script_run_ctx(thread)
+    except Exception:
+        pass
+    thread.start()
+
+
+def _render_score_card(result: dict, exercise: str, explainer: FormScoreExplainer):
+    score  = result["score"]
+    color  = _score_color(score)
+    pct    = int(score * 100)
+    rep_n  = result["rep"]
+    feat60 = result.get("feat60")
 
     st.markdown(
         f"""
@@ -443,31 +573,63 @@ def _render_score_card(result: dict):
             border: 1px solid #444;
             border-radius: 8px;
             padding: 12px 14px;
-            margin-bottom: 8px;
+            margin-bottom: 4px;
             background: #1a1a1a;
         ">
           <div style="display:flex; justify-content:space-between; align-items:center;">
-            <b style="font-size:15px;">Rep {result['rep']}</b>
+            <b style="font-size:15px;">Rep {rep_n}</b>
             <span style="color:{color}; font-weight:bold; font-size:18px;">{pct}%</span>
           </div>
           <div style="background:#333; border-radius:4px; height:10px; margin:6px 0;">
             <div style="background:{color}; width:{pct}%; height:10px; border-radius:4px;"></div>
-          </div>
-          <div style="font-size:12px; color:#aaa;">
-            Top fault: <span style="color:#eee;">{fault}</span>
-          </div>
-          <div style="font-size:12px; color:#ccc; margin-top:4px; font-style:italic;">
-            {cue_txt}
           </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+    _ensure_analysis_state()
+    pending = st.session_state.analysis_pending.get(rep_n, False)
+    analysis_result = st.session_state.analysis_results.get(rep_n)
+
+    if feat60 is not None:
+        if st.button("🔍 Analyse", key=f"analyse_{rep_n}", disabled=pending):
+            _launch_async_analysis(rep_n, feat60, exercise, result["score"], explainer)
+            st.rerun()
+
+    if pending:
+        st.info("🔍 Running analysis...")
+
+    if analysis_result and analysis_result.get("done"):
+        if "error" in analysis_result:
+            st.error(f"Analysis failed: {analysis_result['error']}")
+            return
+        expl = analysis_result["explanation"]
+        feedback = analysis_result["feedback"]
+        fault    = feedback["top_fault"].replace("_", " ").title()
+        cues     = feedback["cues"]
+        cue_txt  = cues[0] if cues else feedback["overall"]
+
+        st.markdown(f"**Top fault:** {fault}  \n*{cue_txt}*")
+
+        shap_vals = expl["shap_values"]   # [60, 8]
+        fig, ax = plt.subplots(figsize=(7, 2.5))
+        ax.imshow(
+            shap_vals.T, aspect="auto", cmap="RdBu_r",
+            vmin=-np.abs(shap_vals).max(), vmax=np.abs(shap_vals).max(),
+        )
+        ax.set_yticks(range(len(FEATURE_NAMES)))
+        ax.set_yticklabels([f.replace("_", " ") for f in FEATURE_NAMES], fontsize=8)
+        ax.set_xlabel("Frame")
+        ax.set_title("SHAP feature contributions")
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
 # ─── Live-update fragments ─────────────────────────────────────────────────────
 
 @st.fragment(run_every=2)
-def _score_panel():
+def _score_panel(exercise: str, explainer: FormScoreExplainer):
     t = st.session_state.get("_transformer")
     results = t.results if t else []
 
@@ -476,7 +638,44 @@ def _score_panel():
         return
 
     for r in reversed(results[-15:]):
-        _render_score_card(r)
+        _render_score_card(r, exercise, explainer)
+
+
+@st.fragment(run_every=1)
+def _status_banner():
+    if not st.session_state.get("active", False):
+        return
+
+    t = st.session_state.get("_transformer")
+    results = t.results if t else []
+    n = len(results)
+
+    # Detect newly scored rep → show "done" message for 2 s
+    if n > st.session_state.get("_prev_result_count", 0):
+        st.session_state._prev_result_count = n
+        st.session_state._done_until        = time.time() + 2.0
+        st.session_state._done_rep_num      = n
+        st.session_state._done_score        = results[-1]["score"] if results else 0.0
+
+    if t and t.is_processing:
+        rep_n = n + 1
+        st.info(f"⚡ Scoring rep {rep_n}…")
+    elif time.time() < st.session_state.get("_done_until", 0):
+        rep_n = st.session_state.get("_done_rep_num", n)
+        pct   = int(st.session_state.get("_done_score", 0.0) * 100)
+        st.success(f"✅ Rep {rep_n} scored — {pct}%")
+    else:
+        st.success("🟢 Ready — perform your next rep")
+
+
+@st.fragment(run_every=1)
+def _analysis_refresh():
+    _ensure_analysis_state()
+    if any(st.session_state.analysis_pending.values()):
+        now = time.time()
+        if now - st.session_state._analysis_last_rerun >= 1.0:
+            st.session_state._analysis_last_rerun = now
+            st.rerun()
 
 
 @st.fragment(run_every=2)
@@ -519,9 +718,10 @@ def main():
         st.session_state.exercise = exercise
         st.session_state.active   = False
 
-    # ── Load pipeline ─────────────────────────────────────
+    # ── Load model + gradient explainer ───────────────────
     with st.spinner(f"Loading {EXERCISE_CONFIGS[exercise]['display_name']} model…"):
-        pipeline = load_pipeline(exercise)
+        _, predict_fn = load_lstm_model(exercise)
+        explainer = load_gradient_explainer(exercise)
 
     # ── Camera device selection ───────────────────────────
     # JS enumerates available cameras and writes them to URL query params.
@@ -597,26 +797,38 @@ def main():
         async_processing=True,
     )
 
+    # ── Status banner (updates every 1 s while active) ────
+    _status_banner()
+
     # ── Start / Stop ──────────────────────────────────────
-    col_start, col_stop, col_hint = st.columns([1, 1, 3])
+    col_start, col_stop, _ = st.columns([1, 1, 3])
     start = col_start.button("▶ Start", type="primary", use_container_width=True)
     stop  = col_stop.button("■ Stop",   use_container_width=True)
-    col_hint.caption("Stand still ~2 s after last rep before stopping.")
 
     if start:
-        st.session_state.active   = True
-        st.session_state.exercise = exercise
+        st.session_state.active             = True
+        st.session_state.exercise           = exercise
+        st.session_state._prev_result_count = 0
+        st.session_state._done_until        = 0.0
+        st.session_state._done_rep_num      = 0
+        st.session_state._done_score        = 0.0
 
-    if stop:
-        st.session_state.active = False
+    if stop and st.session_state.get("active", False):
         t = st.session_state.get("_transformer")
+
+        # ── 5-second countdown (camera keeps running) ─────
+        banner = st.empty()
+        for i in range(5, 0, -1):
+            banner.warning(f"⏸ Stand still — capturing final rep ({i}s)")
+            time.sleep(1)
+        banner.empty()
+
+        # ── Deactivate now that buffer is full ────────────
+        st.session_state.active = False
+
         if t:
-            # ── Final-rep flush ───────────────────────────────
-            # The stability gate only scores reps once a newer rep exists after them,
-            # so the last in-progress rep is never scored during normal polling.
-            # On Stop we run segment_reps one final time on the full buffer and
-            # score any rep whose end hasn't been committed yet.
-            buf, total_fc, scored_ends = t.get_final_state()
+            # Final-rep flush: score the last in-progress rep
+            buf, total_fc, scored_ends, scored_starts = t.get_final_state()
             buf_start = total_fc - len(buf)
 
             if len(buf) >= MIN_REP_FRAMES:
@@ -629,26 +841,27 @@ def main():
                     if rel_e - rel_s < MIN_REP_FRAMES:
                         continue
                     abs_e = rel_e + buf_start
+                    abs_s = rel_s + buf_start
                     if any(abs(abs_e - se) <= 5 for se in scored_ends):
-                        continue       # already scored by background worker
+                        continue
+                    if abs_s in scored_starts:
+                        continue
                     try:
                         rep_lm = buf[rel_s:rel_e]
-                        score, fault, cues, overall = score_rep(rep_lm, exercise, pipeline)
+                        score, feat60 = score_rep(rep_lm, exercise, predict_fn)
                         with t._lock:
                             rep_num = len(t._results) + 1
                             t._results.append({
-                                "rep":       rep_num,
-                                "score":     score,
-                                "top_fault": fault,
-                                "cues":      cues,
-                                "overall":   overall,
+                                "rep":   rep_num,
+                                "score": score,
+                                "feat60": feat60,
                             })
                             t._scored_ends.add(abs_e)
+                            t._scored_starts.add(abs_s)
                         _log({
                             "event":         "rep_scored",
                             "rep_number":    rep_num,
                             "score":         round(score, 4),
-                            "fault":         fault,
                             "buffer_frames": len(buf),
                             "final_rep":     True,
                         })
@@ -663,17 +876,20 @@ def main():
                 "scores":            [round(s, 4) for s in scores],
                 "mean_score":        round(float(np.mean(scores)), 4) if scores else 0.0,
             })
+            n_scored = len(results)
+        else:
+            n_scored = 0
 
-    if st.session_state.active:
-        st.success("Recording — perform your reps!")
-    else:
+        st.success(f"✅ Session complete — {n_scored} reps scored")
+
+    if not st.session_state.get("active", False) and not stop:
         st.info("Press **Start** to begin scoring.")
 
     # ── Wire up processor ─────────────────────────────────
     processor = ctx.video_processor if ctx else None
 
     if processor is not None:
-        processor.pipeline = pipeline
+        processor.predict_fn = predict_fn
         processor.exercise = exercise
         processor.active   = st.session_state.active
         st.session_state._transformer = processor
@@ -682,7 +898,8 @@ def main():
 
     # ── Rep scores ────────────────────────────────────────
     st.subheader("Rep Scores")
-    _score_panel()
+    _analysis_refresh()
+    _score_panel(exercise, explainer)
 
     # ── Session stats ─────────────────────────────────────
     st.divider()

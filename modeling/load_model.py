@@ -87,3 +87,34 @@ def get_predict_fn(model_path: str):
             return m(x_t).cpu().numpy()
 
     return _fn
+
+
+def get_model_and_predict_fn(model_path: str):
+    """
+    Load a BiLSTM checkpoint and return both the raw module and predict wrapper.
+
+    Parameters
+    ----------
+    model_path : str
+        Path to .pt checkpoint.
+
+    Returns
+    -------
+    tuple[LSTMScorer, callable]
+        (model, predict_fn) where model is an eval-mode nn.Module and
+        predict_fn maps [N, 60, 8] numpy -> [N] numpy.
+    """
+    ckpt = pathlib.Path(model_path)
+    if not ckpt.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+
+    m = LSTMScorer().to(_device)
+    m.load_state_dict(torch.load(ckpt, map_location=_device, weights_only=True))
+    m.eval()
+
+    def _fn(X: np.ndarray) -> np.ndarray:
+        with torch.no_grad():
+            x_t = torch.tensor(X, dtype=torch.float32).to(_device)
+            return m(x_t).cpu().numpy()
+
+    return m, _fn
