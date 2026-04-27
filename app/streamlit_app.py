@@ -28,13 +28,15 @@ import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 import streamlit.components.v1 as components
+import torch
 from scipy.ndimage import gaussian_filter1d
 from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
 
 from configs.exercises import EXERCISE_CONFIGS
 from data.synthetic_loader import load_synthetic_exercise
 from explainability.feedback_lookup import get_feedback
-from explainability.shap_explainer import FEATURE_NAMES, FormScoreExplainer
+from explainability.shap_explainer import FormScoreExplainer
+from explainability.shap_heatmap import plot_shap_heatmap
 from modeling.load_model import get_model_and_predict_fn
 from preprocessing.feature_engineer import build_feature_matrix, resample_to_60
 from preprocessing.normalizer import normalize
@@ -526,38 +528,29 @@ def _ensure_analysis_state():
         st.session_state._analysis_last_rerun = 0.0
 
 
-def _launch_async_analysis(rep_idx: int, rep_feat60: np.ndarray, exercise: str, score: float, explainer: FormScoreExplainer):
-    st.session_state.analysis_pending[rep_idx] = True
-    st.session_state.analysis_results[rep_idx] = {"done": False}
-
-    def run_shap(rep_lm: np.ndarray, exercise_name: str, rep_n: int, rep_score: float):
-        try:
-            expl = explainer.explain(rep_lm)
-            fb = get_feedback(expl, rep_score, exercise_name)
-            st.session_state.analysis_results[rep_n] = {
-                "explanation": expl,
-                "feedback": fb,
-                "done": True,
-            }
-        except Exception as exc:
-            st.session_state.analysis_results[rep_n] = {
-                "error": str(exc),
-                "done": True,
-            }
-        finally:
-            st.session_state.analysis_pending[rep_n] = False
-
-    thread = threading.Thread(
-        target=run_shap,
-        args=(rep_feat60, exercise, rep_idx, score),
-        daemon=True,
-    )
+def _run_shap_async(rep_lm: np.ndarray, exercise: str, rep_idx: int, score: float):
     try:
-        from streamlit.runtime.scriptrunner import add_script_run_ctx
-        add_script_run_ctx(thread)
-    except Exception:
-        pass
-    thread.start()
+        model_path = EXERCISE_CONFIGS[exercise]["model_path"]
+        model, _ = get_model_and_predict_fn(model_path)
+        background = load_shap_background(exercise, n_reps=30)
+        bg_tensor = torch.FloatTensor(background)  # [30, 60, 8]
+        explainer = FormScoreExplainer(model, bg_tensor.numpy(), model_type="gradient")
+
+        feat_60 = np.asarray(rep_lm, dtype=np.float32)
+        expl = explainer.explain(feat_60)
+        fb = get_feedback(expl, score, exercise=exercise)
+        st.session_state.analysis_results[rep_idx] = {
+            "explanation": expl,
+            "feedback": fb,
+            "done": True,
+        }
+    except Exception as exc:
+        st.session_state.analysis_results[rep_idx] = {
+            "error": str(exc),
+            "done": True,
+        }
+    finally:
+        st.session_state.analysis_pending[rep_idx] = False
 
 
 def _render_score_card(result: dict, exercise: str, explainer: FormScoreExplainer):
@@ -592,14 +585,6 @@ def _render_score_card(result: dict, exercise: str, explainer: FormScoreExplaine
     pending = st.session_state.analysis_pending.get(rep_n, False)
     analysis_result = st.session_state.analysis_results.get(rep_n)
 
-    if feat60 is not None:
-        if st.button("🔍 Analyse", key=f"analyse_{rep_n}", disabled=pending):
-            _launch_async_analysis(rep_n, feat60, exercise, result["score"], explainer)
-            st.rerun()
-
-    if pending:
-        st.info("🔍 Running analysis...")
-
     if analysis_result and analysis_result.get("done"):
         if "error" in analysis_result:
             st.error(f"Analysis failed: {analysis_result['error']}")
@@ -611,20 +596,44 @@ def _render_score_card(result: dict, exercise: str, explainer: FormScoreExplaine
         cue_txt  = cues[0] if cues else feedback["overall"]
 
         st.markdown(f"**Top fault:** {fault}  \n*{cue_txt}*")
-
-        shap_vals = expl["shap_values"]   # [60, 8]
         fig, ax = plt.subplots(figsize=(7, 2.5))
-        ax.imshow(
-            shap_vals.T, aspect="auto", cmap="RdBu_r",
-            vmin=-np.abs(shap_vals).max(), vmax=np.abs(shap_vals).max(),
+        plot_shap_heatmap(
+            shap_values=expl["shap_values"],
+            form_score=feedback["score"],
+            rep_number=rep_n,
+            top_fault=feedback["top_fault"],
+            frame_peak=feedback["frame_peak"],
+            ax=ax,
         )
-        ax.set_yticks(range(len(FEATURE_NAMES)))
-        ax.set_yticklabels([f.replace("_", " ") for f in FEATURE_NAMES], fontsize=8)
-        ax.set_xlabel("Frame")
-        ax.set_title("SHAP feature contributions")
         plt.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
+        return
+
+    if pending:
+        st.info("🔍 Analysing...")
+        return
+
+    if feat60 is not None and st.button("🔍 Analyse", key=f"analyse_{rep_n}", disabled=pending):
+        cached_result = st.session_state.analysis_results.get(rep_n)
+        if cached_result:
+            st.session_state.analysis_pending[rep_n] = False
+            return
+
+        st.session_state.analysis_pending[rep_n] = True
+        st.session_state.analysis_results[rep_n] = {"done": False}
+        thread = threading.Thread(
+            target=_run_shap_async,
+            args=(feat60, exercise, rep_n, result["score"]),
+            daemon=True,
+        )
+        try:
+            from streamlit.runtime.scriptrunner import add_script_run_ctx
+            add_script_run_ctx(thread)
+        except Exception:
+            pass
+        thread.start()
+        st.info("🔍 Analysing...")
 
 # ─── Live-update fragments ─────────────────────────────────────────────────────
 
@@ -672,10 +681,8 @@ def _status_banner():
 def _analysis_refresh():
     _ensure_analysis_state()
     if any(st.session_state.analysis_pending.values()):
-        now = time.time()
-        if now - st.session_state._analysis_last_rerun >= 1.0:
-            st.session_state._analysis_last_rerun = now
-            st.rerun()
+        time.sleep(0.5)
+        st.rerun()
 
 
 @st.fragment(run_every=2)
