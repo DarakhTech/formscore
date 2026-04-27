@@ -33,11 +33,18 @@ def main():
         fb  = rep["feedback"]
         cue = (fb["cues"][0] if fb["cues"]
                else FEEDBACK_TEMPLATES.get(fb["top_fault"], [(0, fb["overall"])])[0][1])
-        print(f"  Rep {rep['rep_number']}  Score: {rep['form_score']:.2f}  Fault: {fb['top_fault']}")
+        print(
+            f"  Rep {rep['rep_number']}"
+            f"  Hybrid: {rep['score']:.2f}"
+            f"  BiLSTM: {rep['bilstm_score']:.2f}"
+            f"  Rules: {rep['rule_score']:.2f}"
+            f"  Agreement: {rep['agreement']}"
+        )
+        print(f"         → Fault: {fb['top_fault']}")
         print(f"         → \"{cue}\"\n")
 
     s      = result["summary"]
-    scores = [r["form_score"] for r in result["reps"]]
+    scores = [r["score"] for r in result["reps"]]
     print("Summary")
     print(rule)
     print(f"Mean score : {s['mean_score']:.2f}")

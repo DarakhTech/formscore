@@ -64,7 +64,7 @@ def compute_angles_for_exercise(landmarks: np.ndarray, exercise: str = "squat") 
     -------
     np.ndarray [T, 5]
         Columns 0-3: four explicit triplet angles.
-        Column  4:   mean of cols 0 and 1 (composite signal per exercise).
+        Column  4:   mean of cols 2 and 3 (hip_L + hip_R) / 2 = spine_tilt.
     """
     cfg = EXERCISE_CONFIGS[exercise]
     xyz = landmarks[:, :, :3]   # [T, 33, 3]
@@ -74,7 +74,7 @@ def compute_angles_for_exercise(landmarks: np.ndarray, exercise: str = "squat") 
     a1 = _angle_vec(xyz[:, triplets[1][0]], xyz[:, triplets[1][1]], xyz[:, triplets[1][2]])
     a2 = _angle_vec(xyz[:, triplets[2][0]], xyz[:, triplets[2][1]], xyz[:, triplets[2][2]])
     a3 = _angle_vec(xyz[:, triplets[3][0]], xyz[:, triplets[3][1]], xyz[:, triplets[3][2]])
-    a4 = (a0 + a1) / 2.0   # composite: spine_tilt / body_alignment / overhead_ext
+    a4 = (a2 + a3) / 2.0   # spine_tilt / body_alignment / overhead_ext = mean(hip_L, hip_R)
 
     return np.stack([a0, a1, a2, a3, a4], axis=1)  # [T, 5]
 

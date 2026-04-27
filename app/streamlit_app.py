@@ -724,6 +724,16 @@ def main():
     if exercise != st.session_state.exercise:
         st.session_state.exercise = exercise
         st.session_state.active   = False
+        st.session_state._prev_result_count = 0
+        st.session_state._done_until = 0.0
+        st.session_state._done_rep_num = 0
+        st.session_state._done_score = 0.0
+        _ensure_analysis_state()
+        st.session_state.analysis_pending.clear()
+        st.session_state.analysis_results.clear()
+        t = st.session_state.get("_transformer")
+        if t is not None:
+            t.reset()
 
     # ── Load model + gradient explainer ───────────────────
     with st.spinner(f"Loading {EXERCISE_CONFIGS[exercise]['display_name']} model…"):
