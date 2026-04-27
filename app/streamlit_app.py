@@ -41,6 +41,7 @@ from modeling.load_model import get_model_and_predict_fn
 from preprocessing.feature_engineer import build_feature_matrix, resample_to_60
 from preprocessing.normalizer import normalize
 from preprocessing.rep_segmenter import segment_reps
+from preprocessing.rule_scorer import hybrid_score
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 
@@ -553,12 +554,30 @@ def _run_shap_async(rep_lm: np.ndarray, exercise: str, rep_idx: int, score: floa
         st.session_state.analysis_pending[rep_idx] = False
 
 
+_AGREEMENT_COLOR = {
+    "high":   "#2ecc71",   # green
+    "medium": "#f39c12",   # yellow
+    "low":    "#e67e22",   # orange
+}
+
+
 def _render_score_card(result: dict, exercise: str, explainer: FormScoreExplainer):
     score  = result["score"]
     color  = _score_color(score)
     pct    = int(score * 100)
     rep_n  = result["rep"]
     feat60 = result.get("feat60")
+
+    # Compute hybrid/agreement for the interpretation line when feat60 is available.
+    interp_html = ""
+    if feat60 is not None:
+        h = hybrid_score(score, feat60, exercise=exercise)
+        ag_color  = _AGREEMENT_COLOR.get(h["agreement"], "#aaaaaa")
+        interp_html = (
+            f'<div style="margin-top:4px; font-size:12px; font-style:italic; color:{ag_color};">'
+            f'{h["interpretation"]}'
+            f'</div>'
+        )
 
     st.markdown(
         f"""
@@ -576,6 +595,7 @@ def _render_score_card(result: dict, exercise: str, explainer: FormScoreExplaine
           <div style="background:#333; border-radius:4px; height:10px; margin:6px 0;">
             <div style="background:{color}; width:{pct}%; height:10px; border-radius:4px;"></div>
           </div>
+          {interp_html}
         </div>
         """,
         unsafe_allow_html=True,
