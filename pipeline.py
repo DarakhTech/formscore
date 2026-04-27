@@ -62,6 +62,7 @@ from configs.exercises import EXERCISE_CONFIGS
 from data.synthetic_loader import load_synthetic_exercise
 from preprocessing.normalizer import normalize
 from preprocessing.feature_engineer import build_feature_matrix, resample_to_60
+from preprocessing.rule_scorer import hybrid_score
 from explainability.shap_explainer import FormScoreExplainer, FEATURE_NAMES
 from explainability.feedback_lookup import get_feedback
 from modeling.load_model import get_predict_fn
@@ -321,22 +322,32 @@ class FormScorePipeline:
             feat_60 = resample_to_60(feat)                                  # [60, 8]
 
             # ── Stage 5a: Scoring ─────────────────────────
-            score = float(self.model_fn(feat_60[np.newaxis])[0])
+            bilstm_s    = float(self.model_fn(feat_60[np.newaxis])[0])
+            scores_dict = hybrid_score(bilstm_s, feat_60, exercise=self.exercise)
 
             # ── Stage 5b: SHAP explanation ────────────────
             explanation = self.explainer.explain(feat_60)
 
             # ── Stage 5c: Feedback ────────────────────────
-            feedback = get_feedback(explanation, form_score=score, exercise=self.exercise)
+            feedback = get_feedback(
+                explanation,
+                form_score=scores_dict["hybrid"],
+                exercise=self.exercise,
+            )
 
             t_rep_ms = (time.perf_counter() - t_rep_start) * 1000
             latencies_ms.append(t_rep_ms)
 
             rep_result = {
-                "rep_number":  i + 1,
-                "start_frame": start,
-                "end_frame":   end,
-                "form_score":  round(score, 3),
+                "rep_number":   i + 1,
+                "start_frame":  start,
+                "end_frame":    end,
+                "score":          scores_dict["hybrid"],
+                "form_score":     scores_dict["hybrid"],   # backward compat alias
+                "bilstm_score":   scores_dict["bilstm"],
+                "rule_score":     scores_dict["rules"],
+                "agreement":      scores_dict["agreement"],
+                "interpretation": scores_dict["interpretation"],
                 "feedback":    {
                     "overall":    feedback["overall"],
                     "cues":       feedback["cues"],

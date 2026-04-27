@@ -1,0 +1,61 @@
+{
+  "video": "squats.mp4",
+  "exercise": "squat",
+  "n_reps": 3,
+  "reps": [
+    {
+      "rep_number": 1,
+      "start_frame": 0,
+      "end_frame": 168,
+      "form_score": 0.597,
+      "feedback": {
+        "overall": "Form needs work. Focus on the cues below.",
+        "cues": [
+          "Both knees should bend equally.",
+          "Drive your right hip back and down.",
+          "Keep your chest up and spine neutral."
+        ],
+        "top_fault": "knee_symmetry",
+        "frame_peak": 35
+      }
+    },
+    {
+      "rep_number": 2,
+      "start_frame": 168,
+      "end_frame": 366,
+      "form_score": 0.61,
+      "feedback": {
+        "overall": "Decent squat but some form issues to address.",
+        "cues": [
+          "Both knees should bend equally.",
+          "Keep your right knee tracking over your toes.",
+          "Keep your chest up and spine neutral."
+        ],
+        "top_fault": "knee_symmetry",
+        "frame_peak": 34
+      }
+    },
+    {
+      "rep_number": 3,
+      "start_frame": 366,
+      "end_frame": 593,
+      "form_score": 0.591,
+      "feedback": {
+        "overall": "Form needs work. Focus on the cues below.",
+        "cues": [
+          "Keep your right knee tracking over your toes.",
+          "Drive your left hip back and down.",
+          "Both knees should bend equally."
+        ],
+        "top_fault": "knee_angle_right",
+        "frame_peak": 35
+      }
+    }
+  ],
+  "summary": {
+    "mean_score": 0.599,
+    "best_rep": 2,
+    "worst_rep": 3,
+    "latency_ms": 783.6
+  }
+}

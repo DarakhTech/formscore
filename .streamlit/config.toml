@@ -1,0 +1,3 @@
+[server]
+sslCertFile = ".streamlit/cert.pem"
+sslKeyFile  = ".streamlit/key.pem"
