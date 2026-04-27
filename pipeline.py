@@ -342,11 +342,12 @@ class FormScorePipeline:
                 "rep_number":   i + 1,
                 "start_frame":  start,
                 "end_frame":    end,
-                "score":        scores_dict["hybrid"],
-                "form_score":   scores_dict["hybrid"],   # backward compat alias
-                "bilstm_score": scores_dict["bilstm"],
-                "rule_score":   scores_dict["rules"],
-                "agreement":    scores_dict["agreement"],
+                "score":          scores_dict["hybrid"],
+                "form_score":     scores_dict["hybrid"],   # backward compat alias
+                "bilstm_score":   scores_dict["bilstm"],
+                "rule_score":     scores_dict["rules"],
+                "agreement":      scores_dict["agreement"],
+                "interpretation": scores_dict["interpretation"],
                 "feedback":    {
                     "overall":    feedback["overall"],
                     "cues":       feedback["cues"],
