@@ -11,7 +11,7 @@ import numpy as np
 from pipeline import FormScorePipeline
 from explainability.shap_heatmap import plot_rep_summary
 
-VIDEO_PATH  = "tests/squats.mp4"
+VIDEO_PATH  = "tests/squats_10reps.mp4"
 OUTPUT_PATH = "results/shap_summary.png"
 
 

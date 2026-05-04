@@ -217,3 +217,5 @@ extra/
 # Local SSL certs
 .streamlit/*.pem
 app/debug_log.json
+
+/tests/squats_10reps.mp4

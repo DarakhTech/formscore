@@ -121,7 +121,7 @@ def hybrid_score(
     bilstm_score: float,
     feature_matrix: np.ndarray,
     exercise: str = "squat",
-    bilstm_weight: float = 0.8,
+    bilstm_weight: float = 0.80,
 ) -> dict:
     """
     Weighted combination of BiLSTM model score and rule-based score.
@@ -150,10 +150,10 @@ def hybrid_score(
     ))
     delta = abs(bilstm_score - rule_s)
 
-    if delta < 0.1:
+    if delta < 0.2:
         agreement      = "high"
         interpretation = "Both scorers agree — reliable score"
-    elif delta < 0.2:
+    elif delta < 0.3:
         agreement      = "medium"
         interpretation = "Minor disagreement — score is approximate"
     elif bilstm_score > rule_s:
