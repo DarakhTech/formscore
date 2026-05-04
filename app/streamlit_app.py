@@ -513,9 +513,9 @@ class PoseProcessor(VideoProcessorBase):
 # ─── Score card ────────────────────────────────────────────────────────────────
 
 def _score_color(score: float) -> str:
-    if score >= 0.7:
+    if score >= 0.8:
         return "#2ecc71"
-    if score >= 0.5:
+    if score >= 0.6:
         return "#f39c12"
     return "#e74c3c"
 
