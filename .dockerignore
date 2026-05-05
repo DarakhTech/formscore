@@ -1,0 +1,39 @@
+# Version control
+.git
+.gitignore
+
+# Python bytecode and virtual environments
+__pycache__
+*.pyc
+.venv
+*.egg-info
+
+# Large dataset folders (not needed at runtime)
+data/real-time-exercise-recognition-dataset/
+data/workoutfitness-video/
+data/similar_dataset/
+data/my_test_video_1/
+extra/
+
+# Model checkpoints (mounted at runtime via docker-compose volume)
+checkpoints/*.pt
+checkpoints/*.pth
+
+# Result artifacts
+results/*.csv
+results/*.png
+
+# Notebooks and docs
+*.ipynb
+docs/
+
+# macOS metadata
+.DS_Store
+
+# Local SSL certs (replaced by Docker-safe config in Dockerfile)
+.streamlit/cert.pem
+.streamlit/key.pem
+
+# Editor / CI
+.pytest_cache
+.claude

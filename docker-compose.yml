@@ -1,0 +1,11 @@
+services:
+  formscore:
+    build: .
+    image: formscore:latest
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./results:/app/results
+      - ./tests:/app/tests
+    restart: unless-stopped
