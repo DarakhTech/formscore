@@ -20,9 +20,13 @@ REQUIRED: list[str] = [
     "lstm_shoulder_press.pt",
 ]
 
-# Populate with GitHub release asset URLs once checkpoints are published:
-#   "lstm_best_full.pt": "https://github.com/<org>/fitcheck/releases/download/v1.0/lstm_best_full.pt",
-REMOTE_URLS: dict[str, str] = {}
+
+REMOTE_URLS: dict[str, str] = {
+    "lstm_best_full.pt": "https://github.com/DarakhTech/formscore/blob/main/checkpoints/lstm_best_full.pt",
+    "lstm_squat.pt": "https://github.com/DarakhTech/formscore/blob/main/checkpoints/lstm_squat.pt",
+    "lstm_pushup.pt": "https://github.com/DarakhTech/formscore/blob/main/checkpoints/lstm_pushup.pt",
+    "lstm_shoulder_press.pt": "https://github.com/DarakhTech/formscore/blob/main/checkpoints/lstm_shoulder_press.pt"
+}
 
 
 def _download(url: str, dest: pathlib.Path) -> None:
