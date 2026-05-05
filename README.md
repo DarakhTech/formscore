@@ -19,3 +19,8 @@ Then open **http://localhost:8501** in your browser.
 The compose file mounts `./checkpoints`, `./results`, and `./tests` into the container, so your local model files and output are available at runtime without rebuilding.
 
 Step 4: Upload Video/Use Live Feed to Analyze
+
+# Latest Model 
+```bash
+lstm_best_full.pt
+```
