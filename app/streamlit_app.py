@@ -13,6 +13,7 @@ import queue
 import sys
 import threading
 import time
+import tempfile
 import urllib.parse
 from collections import deque
 
@@ -27,7 +28,7 @@ from mediapipe.tasks.python.vision import PoseLandmarkerOptions, PoseLandmarker,
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
-import streamlit.components.v1 as components
+
 import torch
 from scipy.ndimage import gaussian_filter1d
 from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
@@ -42,6 +43,7 @@ from preprocessing.feature_engineer import build_feature_matrix, resample_to_60
 from preprocessing.normalizer import normalize
 from preprocessing.rep_segmenter import segment_reps
 from preprocessing.rule_scorer import hybrid_score
+from pipeline import FormScorePipeline
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 
@@ -720,9 +722,9 @@ def _session_stats():
     c2.metric("Avg Score", f"{np.mean(scores):.0%}")
     c3.metric("Best Rep",  f"#{best_i + 1} ({max(scores):.0%})")
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ─── Live Coach Page ──────────────────────────────────────────────────────────
 
-def main():
+def live_coach_page():
     st.title("FormScore — AI Squat Coach")
 
     # ── Exercise selector ─────────────────────────────────
@@ -778,7 +780,7 @@ def main():
     # Encode current list so JS can compare and avoid infinite redirects
     cam_list_encoded = urllib.parse.quote(json.dumps(cam_list), safe="")
 
-    components.html(f"""
+    st.html(f"""
     <script>
     (async function() {{
       try {{
@@ -802,7 +804,7 @@ def main():
       }} catch(e) {{ console.warn('Camera enum:', e); }}
     }})();
     </script>
-    """, height=0, scrolling=False)
+    """)
 
     # Render Python-side selectbox once we have the camera list
     if cam_list:
@@ -942,6 +944,104 @@ def main():
     st.divider()
     _session_stats()
 
+
+# ─── Analyze Page ─────────────────────────────────────────────────────────────
+
+def analyze_page():
+    st.title("Analyze Form")
+    
+    uploaded_file = st.file_uploader("Choose a video file", type=["mp4", "mov", "avi"])
+    exercise = st.selectbox(
+        "Exercise",
+        ["squat", "pushup", "shoulder_press"],
+        format_func=lambda e: EXERCISE_CONFIGS[e]["display_name"]
+    )
+    
+    if uploaded_file is not None:
+        if st.button("Analyze", type="primary"):
+            with st.spinner("Analyzing your reps..."):
+                # Save uploaded file to temp file
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+                    tmp_file.write(uploaded_file.read())
+                    tmp_path = tmp_file.name
+                    
+                try:
+                    pipeline = FormScorePipeline(exercise=exercise)
+                    results = pipeline.run(tmp_path, include_shap=True)
+                    
+                    st.success(f"Analysis complete! Found {results['n_reps']} reps.")
+                    
+                    for rep in results["reps"]:
+                        score = rep["score"]
+                        color = _score_color(score)
+                        pct = int(score * 100)
+                        rep_n = rep["rep_number"]
+                        
+                        ag_color = _AGREEMENT_COLOR.get(rep["agreement"], "#aaaaaa")
+                        interp_html = (
+                            f'<div style="margin-top:4px; font-size:12px; font-style:italic; color:{ag_color};">'
+                            f'{rep["interpretation"]}'
+                            f'</div>'
+                        )
+                        
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border: 1px solid #444;
+                                border-radius: 8px;
+                                padding: 12px 14px;
+                                margin-bottom: 4px;
+                                background: #1a1a1a;
+                            ">
+                              <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <b style="font-size:15px;">Rep {rep_n}</b>
+                                <span style="color:{color}; font-weight:bold; font-size:18px;">{pct}%</span>
+                              </div>
+                              <div style="background:#333; border-radius:4px; height:10px; margin:6px 0;">
+                                <div style="background:{color}; width:{pct}%; height:10px; border-radius:4px;"></div>
+                              </div>
+                              {interp_html}
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        
+                        fault = rep["feedback"]["top_fault"].replace("_", " ").title()
+                        cues = rep["feedback"]["cues"]
+                        cue_txt = cues[0] if cues else rep["feedback"]["overall"]
+                        
+                        st.markdown(f"**Top fault:** {fault}  \n*{cue_txt}*")
+                        
+                        if "shap_values" in rep:
+                            fig, ax = plt.subplots(figsize=(7, 2.5))
+                            plot_shap_heatmap(
+                                shap_values=np.array(rep["shap_values"]),
+                                form_score=rep["score"],
+                                rep_number=rep_n,
+                                top_fault=rep["feedback"]["top_fault"],
+                                frame_peak=rep["feedback"]["frame_peak"],
+                                ax=ax,
+                            )
+                            plt.tight_layout()
+                            st.pyplot(fig)
+                            plt.close(fig)
+                            
+                        st.divider()
+                        
+                except Exception as e:
+                    st.error(f"Error during analysis: {e}")
+                finally:
+                    os.unlink(tmp_path)
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    page = st.sidebar.radio("Navigation", ["Analyze", "Live Coach"])
+    
+    if page == "Analyze":
+        analyze_page()
+    else:
+        live_coach_page()
 
 if __name__ == "__main__":
     main()
