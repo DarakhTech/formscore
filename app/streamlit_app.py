@@ -1036,6 +1036,12 @@ def analyze_page():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    st.sidebar.title("FormScore")
+    st.sidebar.markdown("""
+### Guide
+1. Analyze: Test video path -> tests/squats.mp4
+2. Live Coach: You may try exercising in front of the camera
+""")
     page = st.sidebar.radio("Navigation", ["Analyze", "Live Coach"])
     
     if page == "Analyze":
